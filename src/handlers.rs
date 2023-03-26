@@ -25,7 +25,7 @@ pub async fn handle_authorize(
     session
         .insert("oidc_session", oidc_session)
         .or_else(|err| {
-            println!("Error storing session: {:?}", err);
+            println!("Error storing session: {}", err);
             Err(session_error())
         })?;
 
@@ -41,6 +41,7 @@ pub async fn handle_callback(
         .get::<OidcSession>("oidc_session")
         .ok_or_else(session_error)?;
 
+    // Validate csrf token stored in session with state param
     if *oidc_session.csrf_token.secret() != params.state {
         return Err(session_error());
     }
@@ -49,9 +50,9 @@ pub async fn handle_callback(
         .grant_auth_code(&params.code, oidc_session)
         .await
     {
-        Ok(result) => Ok((
+        Ok((id_token, claims)) => Ok((
             StatusCode::OK,
-            Json(json!({ "id_token": result.0, "claims": result.1 })),
+            Json(json!({ "id_token": id_token, "claims": claims })),
         )),
         Err(err) => {
             println!("error in grant: {}", err);

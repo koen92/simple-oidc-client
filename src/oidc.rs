@@ -1,51 +1,38 @@
 use crate::config;
+use std::{
+    error::Error,
+    time::{Duration, SystemTime},
+};
 use openidconnect::core::{
-    CoreAuthDisplay, CoreAuthPrompt, CoreAuthenticationFlow, CoreErrorResponseType,
-    CoreGenderClaim, CoreIdTokenClaims, CoreJsonWebKey, CoreJsonWebKeyType, CoreJsonWebKeyUse,
-    CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm, CoreProviderMetadata,
-    CoreRevocableToken, CoreTokenType,
+    CoreAuthenticationFlow, CoreClient, CoreClientAuthMethod, CoreErrorResponseType,
+    CoreIdTokenClaims, CoreProviderMetadata, CoreTokenResponse, CoreTokenType,
 };
 use openidconnect::{
-    reqwest as oidc_reqwest, AuthorizationCode, Client, ClientId, ClientSecret, CsrfToken,
-    DiscoveryError, EmptyAdditionalClaims, EmptyExtraTokenFields, IdTokenFields, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, RevocationErrorResponseType, Scope, StandardErrorResponse,
-    StandardTokenIntrospectionResponse, StandardTokenResponse, TokenResponse,
+    reqwest as oidc_reqwest, AuthorizationCode, ClientId, ClientSecret, CodeTokenRequest,
+    CsrfToken, DiscoveryError, Nonce, PkceCodeChallenge, PkceCodeVerifier, Scope,
+    StandardErrorResponse, TokenResponse,
 };
-use reqwest;
+use reqwest::Error as ReqwestError;
 use serde::{Deserialize, Serialize};
-use std::error::Error;
+use josekit::{
+    jws::JwsHeader,
+    jwt::{self, JwtPayload},
+    JoseError,
+};
+use anyhow::anyhow;
 
-type MyClient = Client<
-    EmptyAdditionalClaims,
-    CoreAuthDisplay,
-    CoreGenderClaim,
-    CoreJweContentEncryptionAlgorithm,
-    CoreJwsSigningAlgorithm,
-    CoreJsonWebKeyType,
-    CoreJsonWebKeyUse,
-    CoreJsonWebKey,
-    CoreAuthPrompt,
+type TokenRequest<'a> = CodeTokenRequest<
+    'a,
     StandardErrorResponse<CoreErrorResponseType>,
-    StandardTokenResponse<
-        IdTokenFields<
-            EmptyAdditionalClaims,
-            EmptyExtraTokenFields,
-            CoreGenderClaim,
-            CoreJweContentEncryptionAlgorithm,
-            CoreJwsSigningAlgorithm,
-            CoreJsonWebKeyType,
-        >,
-        CoreTokenType,
-    >,
+    CoreTokenResponse,
     CoreTokenType,
-    StandardTokenIntrospectionResponse<EmptyExtraTokenFields, CoreTokenType>,
-    CoreRevocableToken,
-    StandardErrorResponse<RevocationErrorResponseType>,
 >;
 
 #[derive(Clone)]
 pub struct OidcClient {
-    client: MyClient,
+    client: CoreClient,
+    auth_method: CoreClientAuthMethod,
+    token_endpoint: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -57,7 +44,7 @@ pub struct OidcSession {
 
 impl OidcClient {
     pub async fn new(
-    ) -> Result<OidcClient, DiscoveryError<openidconnect::reqwest::Error<reqwest::Error>>> {
+    ) -> Result<OidcClient, DiscoveryError<openidconnect::reqwest::Error<ReqwestError>>> {
         println!("Discovering issuer...");
         let provider_metadata = CoreProviderMetadata::discover_async(
             config::get().issuer_url.clone(),
@@ -65,13 +52,36 @@ impl OidcClient {
         )
         .await?;
 
-        let client = MyClient::from_provider_metadata(
+        let token_endpoint = provider_metadata
+            .token_endpoint()
+            .ok_or(DiscoveryError::Other(String::from(
+                "no token endpoint found in discovery data",
+            )))?
+            .to_string();
+
+        let client = CoreClient::from_provider_metadata(
             provider_metadata,
             ClientId::new(config::get().client_id.to_string()),
-            Some(ClientSecret::new(config::get().client_secret.to_string())),
+            config::get()
+                .client_secret
+                .as_ref()
+                .and_then(|client_secret| Some(ClientSecret::new(client_secret.to_string()))),
         );
+
+        let auth_method;
+        if config::get().private_jwt_key.is_some() && config::get().private_jwt_cert_hash.is_some()
+        {
+            auth_method = CoreClientAuthMethod::PrivateKeyJwt;
+        } else {
+            auth_method = CoreClientAuthMethod::ClientSecretPost;
+        }
+
         println!("Found issuer!");
-        Ok(OidcClient { client })
+        Ok(OidcClient {
+            client,
+            auth_method,
+            token_endpoint,
+        })
     }
 
     pub fn get_authorization_url(&self) -> (reqwest::Url, OidcSession) {
@@ -84,7 +94,7 @@ impl OidcClient {
             Nonce::new_random,
         );
 
-        // Add the required scopes (need to use fold, because add_scope requires ownership of the data
+        // Add the required scopes (need to use fold, because add_scope requires ownership of the data)
         let auth_request = config::get()
             .scopes
             .iter()
@@ -109,10 +119,19 @@ impl OidcClient {
         auth_code: &str,
         oidc_session: OidcSession,
     ) -> Result<(String, CoreIdTokenClaims), Box<dyn Error>> {
-        let token_response = self
+        let token_request = self
             .client
             .exchange_code(AuthorizationCode::new(auth_code.to_string()))
-            .set_pkce_verifier(oidc_session.pkce_verifier)
+            .set_pkce_verifier(oidc_session.pkce_verifier);
+
+        let token_request = match self.auth_method {
+            CoreClientAuthMethod::PrivateKeyJwt => {
+                add_private_jwt_params(&self.token_endpoint, token_request)?
+            }
+            _ => token_request,
+        };
+
+        let token_response = token_request
             .request_async(oidc_reqwest::async_http_client)
             .await?;
 
@@ -123,4 +142,60 @@ impl OidcClient {
 
         Ok((id_token.to_string(), claims.clone()))
     }
+}
+
+fn add_private_jwt_params<'a>(
+    issuer_url: &'a str,
+    token_request: TokenRequest<'a>,
+) -> Result<TokenRequest<'a>, JoseError> {
+    let jwt = sign_auth_jwt(issuer_url)?;
+
+    Ok(token_request
+        .add_extra_param(
+            "client_assertion_type",
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        )
+        .add_extra_param("client_assertion", jwt))
+}
+
+fn create_auth_jwt(token_endpoint: &str) -> Result<(JwsHeader, JwtPayload), JoseError> {
+    let mut header = JwsHeader::new();
+    header.set_token_type("JWT");
+
+    header.set_x509_certificate_sha1_thumbprint(
+        config::get()
+            .private_jwt_cert_hash
+            .as_ref()
+            .ok_or(JoseError::InvalidKeyFormat(anyhow!(
+                "No private jwt cert found"
+            )))?,
+    );
+
+    let mut payload = JwtPayload::new();
+    payload.set_audience(vec![token_endpoint]);
+    payload.set_issuer(&config::get().client_id);
+    payload.set_subject(&config::get().client_id);
+    payload.set_jwt_id(uuid::Uuid::new_v4().to_string());
+
+    let current_time = SystemTime::now();
+    payload.set_issued_at(&current_time);
+    payload.set_not_before(&current_time);
+    let expiry_time = current_time + Duration::from_secs(120);
+    payload.set_expires_at(&expiry_time);
+
+    Ok((header, payload))
+}
+
+fn sign_auth_jwt(token_endpoint: &str) -> Result<String, JoseError> {
+    let (header, payload) = create_auth_jwt(token_endpoint)?;
+
+    let signer = config::get()
+        .private_jwt_key
+        .as_ref()
+        .ok_or(JoseError::InvalidKeyFormat(anyhow!(
+            "No private jwt key found"
+        )))?;
+    let jwt = jwt::encode_with_signer(&payload, &header, signer)?;
+
+    Ok(jwt)
 }
