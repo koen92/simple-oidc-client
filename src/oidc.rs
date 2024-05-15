@@ -1,7 +1,9 @@
 use crate::config;
-use std::{
-    error::Error,
-    time::{Duration, SystemTime},
+use anyhow::anyhow;
+use josekit::{
+    jws::JwsHeader,
+    jwt::{self, JwtPayload},
+    JoseError,
 };
 use openidconnect::core::{
     CoreAuthenticationFlow, CoreClient, CoreClientAuthMethod, CoreErrorResponseType,
@@ -9,17 +11,15 @@ use openidconnect::core::{
 };
 use openidconnect::{
     reqwest as oidc_reqwest, AuthorizationCode, ClientId, ClientSecret, CodeTokenRequest,
-    CsrfToken, DiscoveryError, Nonce, PkceCodeChallenge, PkceCodeVerifier, Scope,
+    CsrfToken, DiscoveryError, Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
     StandardErrorResponse, TokenResponse,
 };
 use reqwest::Error as ReqwestError;
 use serde::{Deserialize, Serialize};
-use josekit::{
-    jws::JwsHeader,
-    jwt::{self, JwtPayload},
-    JoseError,
+use std::{
+    error::Error,
+    time::{Duration, SystemTime},
 };
-use anyhow::anyhow;
 
 type TokenRequest<'a> = CodeTokenRequest<
     'a,
@@ -59,6 +59,14 @@ impl OidcClient {
             )))?
             .to_string();
 
+        let redirect_uri = RedirectUrl::new(format!(
+            "http://localhost:{}/oidc/callback",
+            config::get().port
+        ))
+        .or(Err(DiscoveryError::<
+            openidconnect::reqwest::Error<ReqwestError>,
+        >::Other(String::from("invalid redirect uri"))))?;
+
         let client = CoreClient::from_provider_metadata(
             provider_metadata,
             ClientId::new(config::get().client_id.to_string()),
@@ -66,7 +74,8 @@ impl OidcClient {
                 .client_secret
                 .as_ref()
                 .and_then(|client_secret| Some(ClientSecret::new(client_secret.to_string()))),
-        );
+        )
+        .set_redirect_uri(redirect_uri);
 
         let auth_method;
         if config::get().private_jwt_key.is_some() && config::get().private_jwt_cert_hash.is_some()

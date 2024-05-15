@@ -27,7 +27,7 @@ async fn main() {
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", config::get().port);
-    println!("Listening on http://{}", addr);
+    println!("Listening on http://localhost:{}", config::get().port);
     axum::Server::bind(&addr.parse().expect("cannot parse listening address"))
         .serve(app.into_make_service())
         .await
